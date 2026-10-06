@@ -1,10 +1,6 @@
-# ============================================================
-# EARTHQUAKE INSIGHT
-# Earthquake Intelligence & Analytics Dashboard
-# ============================================================
-
 import os
-from datetime import date, time, datetime
+from pathlib import Path
+from datetime import date, datetime
 
 import joblib
 import numpy as np
@@ -12,108 +8,233 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 
 # ============================================================
-# 1. PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
     page_title="Earthquake Insight",
-    page_icon="🌎",
+    page_icon="🌍",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 
 # ============================================================
-# 2. PROJECT PATH
+# PATH
 # ============================================================
 
-BASE_DIR = os.path.dirname(
-    os.path.dirname(
-        os.path.abspath(__file__)
-    )
-)
+BASE_DIR = Path(__file__).resolve().parent.parent
+MODEL_DIR = BASE_DIR / "models"
 
-MODEL_DIR = os.path.join(
-    BASE_DIR,
-    "models"
-)
-
-MODEL_PATH = os.path.join(
-    MODEL_DIR,
-    "random_forest_magnitude.pkl"
-)
-
-FEATURE_PATH = os.path.join(
-    MODEL_DIR,
-    "model_features.pkl"
-)
+MODEL_PATH = MODEL_DIR / "random_forest_magnitude.pkl"
+FEATURES_PATH = MODEL_DIR / "model_features.pkl"
 
 
 # ============================================================
-# 3. DATABASE CONNECTION
+# CUSTOM CSS
+# ============================================================
+
+st.markdown(
+    """
+    <style>
+        .main {
+            padding-top: 1rem;
+        }
+
+        .block-container {
+            padding-top: 1.5rem;
+            padding-bottom: 2rem;
+        }
+
+        .metric-card {
+            padding: 18px;
+            border-radius: 12px;
+            border: 1px solid rgba(128,128,128,0.25);
+            background-color: rgba(128,128,128,0.05);
+            text-align: center;
+        }
+
+        .metric-title {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+
+        .metric-value {
+            font-size: 28px;
+            font-weight: 700;
+        }
+
+        .section-title {
+            font-size: 24px;
+            font-weight: 700;
+            margin-top: 10px;
+            margin-bottom: 15px;
+        }
+
+        .small-note {
+            font-size: 13px;
+            opacity: 0.75;
+        }
+
+        footer {
+            visibility: hidden;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
+
+def get_database_url():
+    """
+    Mengambil DATABASE_URL dari Streamlit Secrets atau
+    environment variable.
+    """
+
+    database_url = None
+
+    # Prioritas 1: Streamlit Secrets
+    try:
+        database_url = st.secrets.get("DATABASE_URL")
+    except Exception:
+        database_url = None
+
+    # Prioritas 2: Environment variable
+    if not database_url:
+        database_url = os.getenv("DATABASE_URL")
+
+    return database_url
+
+
+@st.cache_resource
+def get_engine():
+    database_url = get_database_url()
+
+    if not database_url:
+        return None, (
+            "DATABASE_URL belum dikonfigurasi. "
+            "Tambahkan DATABASE_URL pada Streamlit Secrets."
+        )
+
+    # Normalisasi mysql:// menjadi mysql+pymysql://
+    if database_url.startswith("mysql://"):
+        database_url = database_url.replace(
+            "mysql://",
+            "mysql+pymysql://",
+            1,
+        )
+
+    try:
+        engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+            connect_args={
+                "connect_timeout": 15
+            },
+        )
+
+        # Test koneksi
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+        return engine, None
+
+    except Exception as e:
+        return None, str(e)
+
+
+engine, db_error = get_engine()
+
+
+# ============================================================
+# LOAD MODEL
 # ============================================================
 
 @st.cache_resource
-def get_database_engine():
+def load_model():
+    if not MODEL_PATH.exists():
+        return None, f"Model tidak ditemukan: {MODEL_PATH}"
 
     try:
+        model = joblib.load(MODEL_PATH)
+        return model, None
+    except Exception as e:
+        return None, str(e)
 
-        database_url = os.getenv("DATABASE_URL")
 
-        if database_url:
+@st.cache_resource
+def load_model_features():
+    if not FEATURES_PATH.exists():
+        return None, f"File fitur model tidak ditemukan: {FEATURES_PATH}"
 
-            engine = create_engine(
-                database_url,
-                pool_pre_ping=True
-            )
+    try:
+        features = joblib.load(FEATURES_PATH)
 
-        else:
+        if isinstance(features, np.ndarray):
+            features = features.tolist()
 
-            engine = create_engine(
-                "mysql+pymysql://root:root@127.0.0.1:3306/earthquake_db",
-                pool_pre_ping=True
-            )
-
-        with engine.connect() as connection:
-
-            connection.execute(
-                text("SELECT 1")
-            )
-
-        return engine
+        return list(features), None
 
     except Exception as e:
-
-        st.error(
-            "❌ Koneksi ke database gagal."
-        )
-
-        st.code(
-            str(e)
-        )
-
-        st.info(
-            "Pastikan MySQL/Docker sedang berjalan "
-            "dan database earthquake_db tersedia."
-        )
-
-        st.stop()
+        return None, str(e)
 
 
-engine = get_database_engine()
+model, model_error = load_model()
+model_features, feature_error = load_model_features()
 
 
 # ============================================================
-# 4. LOAD DATA
+# DATABASE TABLE CHECK
+# ============================================================
+
+def check_required_table(engine):
+    if engine is None:
+        return False, "Engine database tidak tersedia."
+
+    try:
+        with engine.connect() as connection:
+            result = connection.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM information_schema.tables
+                    WHERE table_schema = DATABASE()
+                    AND table_name = 'earthquake_data'
+                    """
+                )
+            )
+
+            exists = result.scalar()
+
+        if exists == 1:
+            return True, None
+
+        return False, "Tabel earthquake_data tidak ditemukan."
+
+    except Exception as e:
+        return False, str(e)
+
+
+table_exists, table_error = check_required_table(engine)
+
+
+# ============================================================
+# LOAD DATA
 # ============================================================
 
 @st.cache_data(ttl=300)
-def load_data():
+def load_data(_engine):
 
     query = """
         SELECT
@@ -128,7 +249,10 @@ def load_data():
             status,
             tsunami,
             emsc_id,
+            emsc_event_time,
             emsc_magnitude,
+            emsc_place,
+            emsc_depth_km,
             distance_km,
             magnitude_diff,
             event_date,
@@ -139,247 +263,235 @@ def load_data():
             wind_speed_10m_max,
             surface_pressure_mean
         FROM earthquake_data
-        WHERE magnitude IS NOT NULL
-          AND latitude IS NOT NULL
-          AND longitude IS NOT NULL
+        ORDER BY event_time DESC
     """
 
-    data = pd.read_sql(
-        query,
-        engine
-    )
-
-    if data.empty:
-
-        st.error(
-            "Tabel earthquake_data tidak memiliki data."
-        )
-
-        st.stop()
-
-    # --------------------------------------------------------
-    # Datetime
-    # --------------------------------------------------------
-
-    data["event_time"] = pd.to_datetime(
-        data["event_time"],
-        errors="coerce"
-    )
-
-    # --------------------------------------------------------
-    # Numeric columns
-    # --------------------------------------------------------
-
-    numeric_columns = [
-        "magnitude",
-        "depth_km",
-        "longitude",
-        "latitude",
-        "tsunami",
-        "emsc_magnitude",
-        "distance_km",
-        "magnitude_diff",
-        "temperature_2m_mean",
-        "precipitation_sum",
-        "wind_speed_10m_max",
-        "surface_pressure_mean"
-    ]
-
-    for column in numeric_columns:
-
-        if column in data.columns:
-
-            data[column] = pd.to_numeric(
-                data[column],
-                errors="coerce"
-            )
-
-    # --------------------------------------------------------
-    # Date features
-    # --------------------------------------------------------
-
-    data["year"] = data["event_time"].dt.year
-    data["month"] = data["event_time"].dt.month
-    data["day"] = data["event_time"].dt.day
-    data["hour"] = data["event_time"].dt.hour
-    data["day_of_week"] = data["event_time"].dt.dayofweek
-
-    # --------------------------------------------------------
-    # Magnitude category
-    # --------------------------------------------------------
-
-    data["magnitude_category"] = pd.cut(
-        data["magnitude"],
-        bins=[
-            -np.inf,
-            3,
-            4,
-            5,
-            6,
-            np.inf
-        ],
-        labels=[
-            "Sangat Kecil",
-            "Kecil",
-            "Sedang",
-            "Kuat",
-            "Besar"
-        ]
-    )
-
-    return data
-
-
-df = load_data()
-
-
-# ============================================================
-# 5. LOAD MACHINE LEARNING MODEL
-# ============================================================
-
-@st.cache_resource
-def load_model():
-
-    if not os.path.exists(MODEL_PATH):
-
-        return None
-
     try:
+        df = pd.read_sql(text(query), _engine)
+        return df, None
 
-        return joblib.load(
-            MODEL_PATH
-        )
-
-    except Exception:
-
-        return None
-
-
-@st.cache_resource
-def load_model_features():
-
-    if not os.path.exists(FEATURE_PATH):
-
-        return None
-
-    try:
-
-        return joblib.load(
-            FEATURE_PATH
-        )
-
-    except Exception:
-
-        return None
-
-
-model = load_model()
-
-model_features = load_model_features()
+    except Exception as e:
+        return pd.DataFrame(), str(e)
 
 
 # ============================================================
-# 6. SIDEBAR
+# STOP IF DATABASE ERROR
 # ============================================================
 
-with st.sidebar:
+if engine is None:
 
-    st.title(
-        "🌎 Earthquake Insight"
+    st.error("❌ Koneksi ke database gagal.")
+
+    st.code(
+        db_error if db_error else "DATABASE_URL belum tersedia.",
+        language="text",
     )
 
-    st.caption(
-        "Earthquake Intelligence & Analytics Dashboard"
+    st.info(
+        """
+        Pastikan Streamlit Secrets memiliki DATABASE_URL Aiven.
+
+        Format:
+
+        DATABASE_URL = "mysql+pymysql://avnadmin:PASSWORD@HOST:PORT/earthquake_db?ssl_verify_cert=false"
+
+        Jangan gunakan 127.0.0.1 atau localhost untuk deployment.
+        """
     )
 
-    st.divider()
+    st.stop()
 
-    st.subheader(
-        "Navigation"
+
+if not table_exists:
+
+    st.error("❌ Tabel `earthquake_data` tidak ditemukan.")
+
+    st.code(
+        table_error if table_error else "Tabel tidak tersedia.",
+        language="text",
     )
 
-    page = st.radio(
-        "Pilih halaman:",
-        [
-            "Overview",
-            "Spatial Intelligence",
-            "Seismic Analytics",
-            "Environmental Analytics",
-            "Magnitude Prediction",
-            "Insights",
-            "Data Explorer"
-        ]
-    )
+    st.stop()
 
-    st.divider()
 
-    st.subheader(
-        "Dataset"
-    )
+df, data_error = load_data(engine)
 
-    st.metric(
-        "Total Events",
-        f"{len(df):,}"
-    )
 
-    st.caption(
-        "USGS + EMSC + Open-Meteo"
-    )
+if data_error:
 
-    st.divider()
+    st.error("❌ Data gagal dimuat dari database.")
 
-    if model is not None:
+    st.code(data_error, language="text")
 
-        st.success(
-            "Model tersedia"
+    st.stop()
+
+
+if df.empty:
+
+    st.warning("Database berhasil terhubung, tetapi data earthquake kosong.")
+
+    st.stop()
+
+
+# ============================================================
+# DATA PREPROCESSING
+# ============================================================
+
+numeric_columns = [
+    "magnitude",
+    "depth_km",
+    "longitude",
+    "latitude",
+    "tsunami",
+    "emsc_magnitude",
+    "emsc_depth_km",
+    "distance_km",
+    "magnitude_diff",
+    "weather_lat",
+    "weather_lon",
+    "temperature_2m_mean",
+    "precipitation_sum",
+    "wind_speed_10m_max",
+    "surface_pressure_mean",
+]
+
+for column in numeric_columns:
+    if column in df.columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
         )
 
-    else:
 
-        st.warning(
-            "Model tidak ditemukan"
-        )
-
-
-# ============================================================
-# 7. HEADER
-# ============================================================
-
-st.title(
-    "🌎 Earthquake Insight"
+df["event_time"] = pd.to_datetime(
+    df["event_time"],
+    errors="coerce",
 )
 
-st.subheader(
-    "Earthquake Intelligence & Analytics Dashboard"
+
+df["event_date"] = pd.to_datetime(
+    df["event_date"],
+    errors="coerce",
+)
+
+
+# Gunakan event_time jika event_date kosong
+df["event_date"] = df["event_date"].fillna(
+    df["event_time"]
+)
+
+
+# ============================================================
+# DATE FEATURES
+# ============================================================
+
+df["year"] = df["event_time"].dt.year
+df["month"] = df["event_time"].dt.month
+df["day"] = df["event_time"].dt.day
+df["hour"] = df["event_time"].dt.hour
+df["day_of_week"] = df["event_time"].dt.dayofweek
+
+
+# ============================================================
+# MAGNITUDE CATEGORY
+# ============================================================
+
+def magnitude_category(value):
+
+    if pd.isna(value):
+        return "Tidak Diketahui"
+
+    if value < 3:
+        return "Sangat Kecil"
+
+    if value < 4:
+        return "Kecil"
+
+    if value < 5:
+        return "Sedang"
+
+    if value < 6:
+        return "Kuat"
+
+    return "Besar"
+
+
+df["magnitude_category"] = df["magnitude"].apply(
+    magnitude_category
+)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.title("🌍 Earthquake Insight")
+
+st.sidebar.markdown(
+    "### Navigasi"
+)
+
+page = st.sidebar.radio(
+    "Pilih halaman:",
+    [
+        "Overview",
+        "Spatial Intelligence",
+        "Seismic Analytics",
+        "Environmental Analytics",
+        "Magnitude Prediction",
+        "Insights",
+        "Data Explorer",
+    ],
+)
+
+
+st.sidebar.divider()
+
+st.sidebar.metric(
+    "Total Events",
+    f"{len(df):,}",
+)
+
+st.sidebar.caption(
+    "Integrasi: USGS + EMSC + Open-Meteo"
+)
+
+if model is not None:
+    st.sidebar.success("Model Random Forest siap")
+else:
+    st.sidebar.warning("Model belum tersedia")
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.title("🌍 Earthquake Insight")
+
+st.markdown(
+    """
+    **Dashboard Data Science untuk analisis kejadian gempa bumi
+    berbasis integrasi data USGS, EMSC, dan Open-Meteo.**
+    """
 )
 
 st.caption(
-    "Analisis dan Prediksi Magnitudo Gempa Bumi "
-    "Berbasis Integrasi Data Seismik dan Cuaca"
+    f"Database aktif • {len(df):,} data earthquake"
 )
-
-st.divider()
 
 
 # ============================================================
-# 8. OVERVIEW
+# PAGE 1 — OVERVIEW
 # ============================================================
 
 if page == "Overview":
 
-    st.header(
-        "📊 Overview"
+    st.markdown(
+        '<div class="section-title">Overview Data Gempa</div>',
+        unsafe_allow_html=True,
     )
 
-    st.write(
-        "Halaman ini menyajikan ringkasan statistik "
-        "dari dataset gempa hasil integrasi data "
-        "USGS, EMSC, dan Open-Meteo."
-    )
-
-    # --------------------------------------------------------
-    # KPI
-    # --------------------------------------------------------
+    col1, col2, col3, col4 = st.columns(4)
 
     total_events = len(df)
 
@@ -389,117 +501,63 @@ if page == "Overview":
 
     avg_depth = df["depth_km"].mean()
 
-    tsunami_total = int(
-        df["tsunami"]
-        .fillna(0)
-        .sum()
-    )
-
-    unique_locations = df["place"].nunique()
-
-    col1, col2, col3 = st.columns(3)
-
     with col1:
-
         st.metric(
-            "🌋 Total Gempa",
-            f"{total_events:,}"
+            "Total Gempa",
+            f"{total_events:,}",
         )
 
     with col2:
-
         st.metric(
-            "📈 Rata-rata Magnitudo",
-            f"{avg_magnitude:.2f}"
+            "Rata-rata Magnitudo",
+            f"{avg_magnitude:.2f}",
         )
 
     with col3:
-
         st.metric(
-            "🔺 Magnitudo Maksimum",
-            f"{max_magnitude:.2f}"
+            "Magnitudo Maksimum",
+            f"{max_magnitude:.2f}",
         )
-
-    col4, col5, col6 = st.columns(3)
 
     with col4:
-
         st.metric(
-            "📍 Rata-rata Kedalaman",
-            f"{avg_depth:.2f} km"
-        )
-
-    with col5:
-
-        st.metric(
-            "🌊 Indikasi Tsunami",
-            f"{tsunami_total:,}"
-        )
-
-    with col6:
-
-        st.metric(
-            "📌 Lokasi",
-            f"{unique_locations:,}"
+            "Rata-rata Kedalaman",
+            f"{avg_depth:.2f} km",
         )
 
     st.divider()
-
-    # --------------------------------------------------------
-    # MONTHLY DISTRIBUTION
-    # --------------------------------------------------------
 
     col1, col2 = st.columns(2)
 
     with col1:
 
         monthly = (
-            df.groupby("month")
-            .size()
-            .reset_index(
-                name="jumlah"
+            df.dropna(subset=["event_time"])
+            .assign(
+                month_period=lambda x:
+                x["event_time"].dt.to_period("M").astype(str)
             )
+            .groupby("month_period")
+            .size()
+            .reset_index(name="jumlah_gempa")
         )
 
-        month_names = {
-            1: "Januari",
-            2: "Februari",
-            3: "Maret",
-            4: "April",
-            5: "Mei",
-            6: "Juni",
-            7: "Juli",
-            8: "Agustus",
-            9: "September",
-            10: "Oktober",
-            11: "November",
-            12: "Desember"
-        }
-
-        monthly["bulan"] = (
-            monthly["month"]
-            .map(month_names)
-        )
-
-        fig = px.bar(
+        fig = px.line(
             monthly,
-            x="bulan",
-            y="jumlah",
-            title="Jumlah Gempa Berdasarkan Bulan",
-            labels={
-                "bulan": "Bulan",
-                "jumlah": "Jumlah Gempa"
-            }
+            x="month_period",
+            y="jumlah_gempa",
+            markers=True,
+            title="Distribusi Gempa per Bulan",
         )
 
         fig.update_layout(
-            template="plotly_white",
-            height=430
+            xaxis_title="Bulan",
+            yaxis_title="Jumlah Gempa",
         )
 
         st.plotly_chart(
             fig,
-            use_container_width=True
+            use_container_width=True,
         )
 
     with col2:
@@ -507,60 +565,63 @@ if page == "Overview":
         fig = px.histogram(
             df,
             x="magnitude",
-            nbins=35,
+            nbins=30,
             title="Distribusi Magnitudo",
-            labels={
-                "magnitude": "Magnitudo",
-                "count": "Jumlah"
-            }
         )
 
         fig.update_layout(
-            template="plotly_white",
-            height=430
+            xaxis_title="Magnitudo",
+            yaxis_title="Jumlah Kejadian",
         )
 
         st.plotly_chart(
             fig,
-            use_container_width=True
+            use_container_width=True,
         )
-
-    # --------------------------------------------------------
-    # YEARLY TREND
-    # --------------------------------------------------------
 
     col1, col2 = st.columns(2)
 
     with col1:
 
         yearly = (
-            df.groupby("year")
-            .size()
-            .reset_index(
-                name="jumlah"
+            df.dropna(subset=["year"])
+            .groupby("year")
+            .agg(
+                rata_rata=("magnitude", "mean"),
+                maksimum=("magnitude", "max"),
+            )
+            .reset_index()
+        )
+
+        fig = go.Figure()
+
+        fig.add_trace(
+            go.Scatter(
+                x=yearly["year"],
+                y=yearly["rata_rata"],
+                mode="lines+markers",
+                name="Rata-rata",
             )
         )
 
-        fig = px.line(
-            yearly,
-            x="year",
-            y="jumlah",
-            markers=True,
-            title="Tren Jumlah Gempa per Tahun",
-            labels={
-                "year": "Tahun",
-                "jumlah": "Jumlah Gempa"
-            }
+        fig.add_trace(
+            go.Scatter(
+                x=yearly["year"],
+                y=yearly["maksimum"],
+                mode="lines+markers",
+                name="Maksimum",
+            )
         )
 
         fig.update_layout(
-            template="plotly_white",
-            height=430
+            title="Tren Magnitudo Berdasarkan Tahun",
+            xaxis_title="Tahun",
+            yaxis_title="Magnitudo",
         )
 
         st.plotly_chart(
             fig,
-            use_container_width=True
+            use_container_width=True,
         )
 
     with col2:
@@ -573,84 +634,60 @@ if page == "Overview":
 
         category.columns = [
             "kategori",
-            "jumlah"
+            "jumlah",
         ]
 
         fig = px.pie(
             category,
             names="kategori",
             values="jumlah",
-            hole=0.45,
-            title="Komposisi Kategori Magnitudo"
-        )
-
-        fig.update_layout(
-            template="plotly_white",
-            height=430
+            title="Kategori Magnitudo",
+            hole=0.4,
         )
 
         st.plotly_chart(
             fig,
-            use_container_width=True
+            use_container_width=True,
         )
 
 
 # ============================================================
-# 9. SPATIAL INTELLIGENCE
+# PAGE 2 — SPATIAL
 # ============================================================
 
 elif page == "Spatial Intelligence":
 
-    st.header(
-        "🗺️ Spatial Intelligence"
+    st.markdown(
+        '<div class="section-title">Spatial Intelligence</div>',
+        unsafe_allow_html=True,
     )
 
-    st.write(
-        "Eksplorasi persebaran lokasi gempa berdasarkan "
-        "koordinat geografis, magnitudo, dan kedalaman."
-    )
-
-    # --------------------------------------------------------
-    # Map
-    # --------------------------------------------------------
-
-    map_data = df[
-        [
+    map_df = df.dropna(
+        subset=[
             "latitude",
             "longitude",
             "magnitude",
-            "depth_km",
-            "place",
-            "event_time"
         ]
-    ].dropna()
+    ).copy()
 
-    # Batasi data untuk menjaga performa browser
-    if len(map_data) > 8000:
+    map_df["abs_magnitude"] = map_df["magnitude"].abs()
 
-        map_data = map_data.sample(
-            8000,
-            random_state=42
-        )
+    st.subheader("Peta Persebaran Gempa")
 
     fig = px.scatter_map(
-        map_data,
+        map_df,
         lat="latitude",
         lon="longitude",
+        size="abs_magnitude",
         color="magnitude",
-        size="magnitude",
         hover_name="place",
-        hover_data={
-            "latitude": ":.3f",
-            "longitude": ":.3f",
-            "magnitude": ":.2f",
-            "depth_km": ":.2f",
-            "event_time": True
-        },
+        hover_data=[
+            "magnitude",
+            "depth_km",
+            "event_time",
+        ],
         zoom=1,
-        height=650,
-        color_continuous_scale="Turbo",
-        title="Persebaran Gempa Bumi"
+        height=600,
     )
 
     fig.update_layout(
@@ -658,95 +695,47 @@ elif page == "Spatial Intelligence":
         margin=dict(
             l=0,
             r=0,
-            t=60,
-            b=0
-        )
+            t=0,
+            b=0,
+        ),
     )
 
     st.plotly_chart(
         fig,
-        use_container_width=True
+        use_container_width=True,
     )
 
-    # --------------------------------------------------------
-    # Geographic analysis
-    # --------------------------------------------------------
+    st.subheader("Hubungan Kedalaman dan Magnitudo")
 
-    col1, col2 = st.columns(2)
-
-    sample = df.sample(
-        min(len(df), 7000),
-        random_state=100
+    fig = px.scatter(
+        df,
+        x="longitude",
+        y="latitude",
+        size="magnitude",
+        color="depth_km",
+        hover_data=[
+            "place",
+            "magnitude",
+            "depth_km",
+        ],
+        title="Distribusi Spasial Berdasarkan Kedalaman",
     )
 
-    with col1:
-
-        fig = px.scatter(
-            sample,
-            x="longitude",
-            y="latitude",
-            color="magnitude",
-            size="magnitude",
-            title="Distribusi Magnitudo Secara Spasial",
-            labels={
-                "longitude": "Longitude",
-                "latitude": "Latitude",
-                "magnitude": "Magnitudo"
-            },
-            color_continuous_scale="Turbo"
-        )
-
-        fig.update_layout(
-            template="plotly_white",
-            height=450
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    with col2:
-
-        fig = px.scatter(
-            sample,
-            x="longitude",
-            y="latitude",
-            color="depth_km",
-            size="magnitude",
-            title="Distribusi Kedalaman Secara Spasial",
-            labels={
-                "longitude": "Longitude",
-                "latitude": "Latitude",
-                "depth_km": "Kedalaman (km)"
-            },
-            color_continuous_scale="Viridis"
-        )
-
-        fig.update_layout(
-            template="plotly_white",
-            height=450
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+    )
 
 
 # ============================================================
-# 10. SEISMIC ANALYTICS
+# PAGE 3 — SEISMIC ANALYTICS
 # ============================================================
 
 elif page == "Seismic Analytics":
 
-    st.header(
-        "📈 Seismic Analytics"
-    )
-
-    st.write(
-        "Analisis karakteristik aktivitas gempa berdasarkan "
-        "magnitudo, kedalaman, waktu, dan jenis magnitudo."
+    st.markdown(
+        '<div class="section-title">Seismic Analytics</div>',
+        unsafe_allow_html=True,
     )
 
     col1, col2 = st.columns(2)
@@ -758,372 +747,228 @@ elif page == "Seismic Analytics":
             x="depth_km",
             nbins=40,
             title="Distribusi Kedalaman Gempa",
-            labels={
-                "depth_km": "Kedalaman (km)"
-            }
         )
 
         fig.update_layout(
-            template="plotly_white",
-            height=430
+            xaxis_title="Kedalaman (km)",
+            yaxis_title="Jumlah Gempa",
         )
 
         st.plotly_chart(
             fig,
-            use_container_width=True
+            use_container_width=True,
         )
 
     with col2:
 
-        sample = df.sample(
-            min(len(df), 7000),
-            random_state=200
-        )
-
         fig = px.scatter(
-            sample,
+            df,
             x="depth_km",
             y="magnitude",
             color="magnitude",
-            opacity=0.6,
-            title="Hubungan Kedalaman dan Magnitudo",
-            labels={
-                "depth_km": "Kedalaman (km)",
-                "magnitude": "Magnitudo"
-            },
-            color_continuous_scale="Turbo"
+            hover_data=[
+                "place",
+                "event_time",
+            ],
+            title="Kedalaman vs Magnitudo",
         )
 
         fig.update_layout(
-            template="plotly_white",
-            height=430
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        yearly_magnitude = (
-            df.groupby("year")["magnitude"]
-            .agg(
-                rata_rata="mean",
-                maksimum="max"
-            )
-            .reset_index()
-        )
-
-        fig = go.Figure()
-
-        fig.add_trace(
-            go.Scatter(
-                x=yearly_magnitude["year"],
-                y=yearly_magnitude["rata_rata"],
-                mode="lines+markers",
-                name="Rata-rata"
-            )
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=yearly_magnitude["year"],
-                y=yearly_magnitude["maksimum"],
-                mode="lines+markers",
-                name="Maksimum"
-            )
-        )
-
-        fig.update_layout(
-            title="Magnitudo Rata-rata dan Maksimum per Tahun",
-            xaxis_title="Tahun",
+            xaxis_title="Kedalaman (km)",
             yaxis_title="Magnitudo",
-            template="plotly_white",
-            height=430
         )
 
         st.plotly_chart(
             fig,
-            use_container_width=True
+            use_container_width=True,
         )
 
-    with col2:
+    yearly = (
+        df.dropna(subset=["year"])
+        .groupby("year")
+        .agg(
+            rata_rata_magnitudo=("magnitude", "mean"),
+            maksimum_magnitudo=("magnitude", "max"),
+            rata_rata_kedalaman=("depth_km", "mean"),
+        )
+        .reset_index()
+    )
+
+    st.subheader("Statistik Tahunan")
+
+    st.dataframe(
+        yearly,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("Distribusi Magnitude Type")
+
+    if "mag_type" in df.columns:
 
         mag_type = (
             df["mag_type"]
             .fillna("Unknown")
             .value_counts()
-            .head(10)
             .reset_index()
         )
 
         mag_type.columns = [
-            "jenis",
-            "jumlah"
+            "mag_type",
+            "jumlah",
         ]
 
         fig = px.bar(
             mag_type,
-            x="jenis",
+            x="mag_type",
             y="jumlah",
-            title="Jenis Magnitudo",
-            labels={
-                "jenis": "Magnitude Type",
-                "jumlah": "Jumlah"
-            }
-        )
-
-        fig.update_layout(
-            template="plotly_white",
-            height=430
+            title="Magnitude Type",
         )
 
         st.plotly_chart(
             fig,
-            use_container_width=True
+            use_container_width=True,
         )
 
-    st.subheader(
-        "Statistik Deskriptif"
-    )
-
-    statistical_columns = [
-        "magnitude",
-        "depth_km",
-        "distance_km",
-        "temperature_2m_mean",
-        "precipitation_sum",
-        "wind_speed_10m_max",
-        "surface_pressure_mean"
-    ]
-
-    statistics = (
-        df[statistical_columns]
-        .describe()
-        .T
-        .round(3)
-    )
+    st.subheader("Statistik Deskriptif")
 
     st.dataframe(
-        statistics,
-        use_container_width=True
+        df[
+            [
+                "magnitude",
+                "depth_km",
+                "latitude",
+                "longitude",
+            ]
+        ].describe().round(3),
+        use_container_width=True,
     )
 
 
 # ============================================================
-# 11. ENVIRONMENTAL ANALYTICS
+# PAGE 4 — ENVIRONMENTAL ANALYTICS
 # ============================================================
 
 elif page == "Environmental Analytics":
 
-    st.header(
-        "🌦️ Environmental Analytics"
+    st.markdown(
+        '<div class="section-title">Environmental Analytics</div>',
+        unsafe_allow_html=True,
     )
 
-    st.write(
-        "Analisis kondisi cuaca yang terintegrasi dengan "
-        "data kejadian gempa."
-    )
-
-    sample = df.sample(
-        min(len(df), 7000),
-        random_state=300
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        fig = px.scatter(
-            sample,
-            x="temperature_2m_mean",
-            y="magnitude",
-            color="magnitude",
-            opacity=0.6,
-            title="Temperatur dan Magnitudo",
-            labels={
-                "temperature_2m_mean": "Temperatur",
-                "magnitude": "Magnitudo"
-            },
-            color_continuous_scale="Turbo"
-        )
-
-        fig.update_layout(
-            template="plotly_white",
-            height=430
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    with col2:
-
-        fig = px.scatter(
-            sample,
-            x="precipitation_sum",
-            y="magnitude",
-            color="magnitude",
-            opacity=0.6,
-            title="Curah Hujan dan Magnitudo",
-            labels={
-                "precipitation_sum": "Curah Hujan",
-                "magnitude": "Magnitudo"
-            },
-            color_continuous_scale="Turbo"
-        )
-
-        fig.update_layout(
-            template="plotly_white",
-            height=430
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        fig = px.scatter(
-            sample,
-            x="wind_speed_10m_max",
-            y="magnitude",
-            color="magnitude",
-            opacity=0.6,
-            title="Kecepatan Angin dan Magnitudo",
-            labels={
-                "wind_speed_10m_max": "Kecepatan Angin",
-                "magnitude": "Magnitudo"
-            },
-            color_continuous_scale="Turbo"
-        )
-
-        fig.update_layout(
-            template="plotly_white",
-            height=430
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    with col2:
-
-        fig = px.scatter(
-            sample,
-            x="surface_pressure_mean",
-            y="magnitude",
-            color="magnitude",
-            opacity=0.6,
-            title="Tekanan Permukaan dan Magnitudo",
-            labels={
-                "surface_pressure_mean": "Tekanan Permukaan",
-                "magnitude": "Magnitudo"
-            },
-            color_continuous_scale="Turbo"
-        )
-
-        fig.update_layout(
-            template="plotly_white",
-            height=430
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    st.subheader(
-        "Matriks Korelasi"
-    )
-
-    correlation_columns = [
-        "magnitude",
-        "depth_km",
-        "distance_km",
+    environmental_columns = [
         "temperature_2m_mean",
         "precipitation_sum",
         "wind_speed_10m_max",
-        "surface_pressure_mean"
+        "surface_pressure_mean",
     ]
 
-    correlation = (
-        df[correlation_columns]
-        .corr()
-    )
+    available_environmental = [
+        col
+        for col in environmental_columns
+        if col in df.columns
+    ]
 
-    fig = px.imshow(
-        correlation,
-        text_auto=".2f",
-        aspect="auto",
-        title="Korelasi Variabel"
-    )
+    if not available_environmental:
 
-    fig.update_layout(
-        template="plotly_white",
-        height=600
-    )
+        st.warning(
+            "Data Open-Meteo tidak tersedia pada tabel earthquake_data."
+        )
 
-    st.plotly_chart(
-        fig,
-        use_container_width=True
-    )
+    else:
+
+        for column in available_environmental:
+
+            temp_df = df[
+                [
+                    column,
+                    "magnitude",
+                ]
+            ].dropna()
+
+            if temp_df.empty:
+                continue
+
+            fig = px.scatter(
+                temp_df,
+                x=column,
+                y="magnitude",
+                trendline="ols",
+                title=f"{column} vs Magnitudo",
+            )
+
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+            )
+
+        st.subheader(
+            "Korelasi Variabel Lingkungan dengan Magnitudo"
+        )
+
+        correlation_columns = [
+            "magnitude"
+        ] + available_environmental
+
+        correlation = (
+            df[correlation_columns]
+            .corr(numeric_only=True)
+            .round(3)
+        )
+
+        fig = px.imshow(
+            correlation,
+            text_auto=True,
+            aspect="auto",
+            title="Correlation Heatmap",
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+        )
 
 
 # ============================================================
-# 12. MAGNITUDE PREDICTION
+# PAGE 5 — MAGNITUDE PREDICTION
 # ============================================================
 
 elif page == "Magnitude Prediction":
 
-    st.header(
-        "🔮 Magnitude Prediction"
-    )
-
-    st.write(
-        "Gunakan karakteristik kejadian untuk memperoleh "
-        "estimasi nilai magnitudo menggunakan Random Forest."
+    st.markdown(
+        '<div class="section-title">AI Magnitude Prediction</div>',
+        unsafe_allow_html=True,
     )
 
     st.info(
-        "Catatan: model ini mengestimasi nilai magnitudo "
-        "berdasarkan karakteristik yang dimasukkan. Model "
-        "bukan alat untuk memprediksi kapan gempa akan terjadi."
+        """
+        Fitur ini menggunakan Random Forest Regressor untuk
+        memperkirakan magnitudo berdasarkan karakteristik
+        lokasi, kedalaman, jarak, waktu, dan kondisi lingkungan.
+        """
     )
 
     if model is None:
 
         st.error(
-            "Model Random Forest tidak ditemukan."
+            "Model Random Forest tidak dapat dimuat."
         )
 
-        st.code(
-            MODEL_PATH
-        )
+        if model_error:
+            st.code(model_error)
 
     elif model_features is None:
 
         st.error(
-            "File model_features.pkl tidak ditemukan."
+            "Fitur model tidak dapat dimuat."
         )
 
-        st.code(
-            FEATURE_PATH
-        )
+        if feature_error:
+            st.code(feature_error)
 
     else:
 
-        st.subheader(
-            "Input Karakteristik Gempa"
-        )
+        st.subheader("Input Data")
 
         col1, col2, col3 = st.columns(3)
 
@@ -1131,109 +976,92 @@ elif page == "Magnitude Prediction":
 
             latitude = st.number_input(
                 "Latitude",
+                value=-4.0,
                 min_value=-90.0,
                 max_value=90.0,
-                value=-4.0,
-                step=0.1
+                step=0.01,
             )
 
             longitude = st.number_input(
                 "Longitude",
+                value=122.5,
                 min_value=-180.0,
                 max_value=180.0,
-                value=122.5,
-                step=0.1
+                step=0.01,
             )
 
-            depth = st.number_input(
-                "Depth (km)",
-                min_value=0.0,
+            depth_km = st.number_input(
+                "Kedalaman (km)",
                 value=10.0,
-                step=1.0
+                min_value=0.0,
+                step=0.1,
             )
 
         with col2:
 
-            distance = st.number_input(
-                "Distance (km)",
+            distance_km = st.number_input(
+                "Jarak (km)",
+                value=0.0,
                 min_value=0.0,
-                value=100.0,
-                step=1.0
+                step=0.1,
             )
 
             temperature = st.number_input(
-                "Temperature",
+                "Temperatur Rata-rata",
                 value=25.0,
-                step=0.5
+                step=0.1,
             )
 
             precipitation = st.number_input(
-                "Rainfall",
-                min_value=0.0,
+                "Curah Hujan",
                 value=0.0,
-                step=0.5
+                min_value=0.0,
+                step=0.1,
             )
 
         with col3:
 
             wind_speed = st.number_input(
-                "Wind Speed",
-                min_value=0.0,
+                "Kecepatan Angin Maksimum",
                 value=10.0,
-                step=0.5
+                min_value=0.0,
+                step=0.1,
             )
 
             pressure = st.number_input(
-                "Surface Pressure",
-                min_value=0.0,
-                value=1010.0,
-                step=1.0
+                "Tekanan Permukaan Rata-rata",
+                value=1013.0,
+                step=0.1,
             )
 
-        st.subheader(
-            "Waktu Kejadian"
-        )
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-
-            event_date = st.date_input(
-                "Tanggal",
-                value=date.today()
+            event_date_input = st.date_input(
+                "Tanggal Kejadian",
+                value=date.today(),
             )
 
-        with col2:
-
-            event_time = st.time_input(
-                "Waktu",
-                value=time(12, 0)
+            event_time_input = st.time_input(
+                "Waktu Kejadian",
+                value=datetime.now().time(),
             )
 
-        st.divider()
-
-        predict = st.button(
-            "🔮 PREDICT MAGNITUDE",
+        predict_button = st.button(
+            "🔮 Prediksi Magnitudo",
             type="primary",
-            use_container_width=True
+            use_container_width=True,
         )
 
-        if predict:
+        if predict_button:
 
             event_datetime = datetime.combine(
-                event_date,
-                event_time
+                event_date_input,
+                event_time_input,
             )
 
-            # ------------------------------------------------
-            # Prepare input
-            # ------------------------------------------------
-
-            input_data = {
-                "depth_km": depth,
+            input_dict = {
                 "latitude": latitude,
                 "longitude": longitude,
-                "distance_km": distance,
+                "depth_km": depth_km,
+                "distance_km": distance_km,
                 "temperature_2m_mean": temperature,
                 "precipitation_sum": precipitation,
                 "wind_speed_10m_max": wind_speed,
@@ -1242,533 +1070,387 @@ elif page == "Magnitude Prediction":
                 "month": event_datetime.month,
                 "day": event_datetime.day,
                 "hour": event_datetime.hour,
-                "day_of_week": event_datetime.weekday()
+                "day_of_week": event_datetime.weekday(),
             }
 
             input_df = pd.DataFrame(
-                [input_data]
+                [input_dict]
             )
 
-            # ------------------------------------------------
-            # Check model features
-            # ------------------------------------------------
+            # Pastikan seluruh fitur model tersedia
+            for feature in model_features:
 
-            missing_features = [
-                feature
-                for feature in model_features
-                if feature not in input_df.columns
+                if feature not in input_df.columns:
+
+                    # Nilai default untuk fitur yang tidak
+                    # digunakan langsung oleh interface
+                    input_df[feature] = 0.0
+
+            # Susun sesuai urutan saat training
+            input_df = input_df[
+                model_features
             ]
 
-            if missing_features:
+            try:
+
+                prediction = model.predict(
+                    input_df
+                )[0]
+
+                prediction = float(prediction)
+
+                category = magnitude_category(
+                    prediction
+                )
+
+                st.success(
+                    "Prediksi berhasil dilakukan."
+                )
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+
+                    st.metric(
+                        "Prediksi Magnitudo",
+                        f"{prediction:.2f}",
+                    )
+
+                with col2:
+
+                    st.metric(
+                        "Kategori",
+                        category,
+                    )
+
+                st.divider()
+
+                st.subheader(
+                    "Input yang digunakan model"
+                )
+
+                st.dataframe(
+                    input_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.warning(
+                    """
+                    Catatan: model ini digunakan untuk
+                    memperkirakan nilai magnitudo berdasarkan
+                    fitur input. Model bukan alat untuk
+                    menentukan secara pasti kapan dan di mana
+                    gempa akan terjadi.
+                    """
+                )
+
+            except Exception as e:
 
                 st.error(
-                    "Fitur berikut dibutuhkan model tetapi "
-                    "belum tersedia:"
+                    "Prediksi gagal dilakukan."
                 )
 
-                st.write(
-                    missing_features
+                st.code(
+                    str(e),
+                    language="text",
                 )
-
-            else:
-
-                try:
-
-                    # Pastikan urutan fitur
-                    # sama persis dengan training
-
-                    input_df = input_df[
-                        model_features
-                    ]
-
-                    prediction = float(
-                        model.predict(
-                            input_df
-                        )[0]
-                    )
-
-                    # ------------------------------------------------
-                    # Magnitude category
-                    # ------------------------------------------------
-
-                    if prediction < 3:
-
-                        category = "Sangat Kecil"
-
-                    elif prediction < 4:
-
-                        category = "Kecil"
-
-                    elif prediction < 5:
-
-                        category = "Sedang"
-
-                    elif prediction < 6:
-
-                        category = "Kuat"
-
-                    else:
-
-                        category = "Besar"
-
-                    # ------------------------------------------------
-                    # Result
-                    # ------------------------------------------------
-
-                    st.success(
-                        "Prediksi berhasil dilakukan."
-                    )
-
-                    st.subheader(
-                        "Hasil Prediksi"
-                    )
-
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-
-                        st.metric(
-                            "Predicted Magnitude",
-                            f"{prediction:.2f}"
-                        )
-
-                    with col2:
-
-                        st.metric(
-                            "Kategori",
-                            category
-                        )
-
-                    # ------------------------------------------------
-                    # Model performance
-                    # ------------------------------------------------
-
-                    st.divider()
-
-                    st.subheader(
-                        "Performa Model"
-                    )
-
-                    m1, m2, m3 = st.columns(3)
-
-                    with m1:
-
-                        st.metric(
-                            "MAE",
-                            "0.2254"
-                        )
-
-                    with m2:
-
-                        st.metric(
-                            "RMSE",
-                            "0.3241"
-                        )
-
-                    with m3:
-
-                        st.metric(
-                            "R²",
-                            "0.3513"
-                        )
-
-                    st.info(
-                        "Interpretasi: model memiliki R² sebesar "
-                        "0.3513 pada data pengujian. Nilai prediksi "
-                        "merupakan estimasi berdasarkan pola data "
-                        "historis dan tidak menjamin terjadinya "
-                        "gempa pada masa mendatang."
-                    )
-
-                    # ------------------------------------------------
-                    # Input summary
-                    # ------------------------------------------------
-
-                    with st.expander(
-                        "Lihat detail input prediksi"
-                    ):
-
-                        display_input = input_df.copy()
-
-                        st.dataframe(
-                            display_input,
-                            use_container_width=True
-                        )
-
-                except Exception as e:
-
-                    st.error(
-                        "Prediksi gagal."
-                    )
-
-                    st.code(
-                        str(e)
-                    )
 
 
 # ============================================================
-# 13. INSIGHTS
+# PAGE 6 — INSIGHTS
 # ============================================================
 
 elif page == "Insights":
 
-    st.header(
-        "💡 Key Insights"
+    st.markdown(
+        '<div class="section-title">Insights</div>',
+        unsafe_allow_html=True,
     )
-
-    st.write(
-        "Ringkasan temuan utama berdasarkan hasil "
-        "eksplorasi dataset."
-    )
-
-    # --------------------------------------------------------
-    # Maximum magnitude
-    # --------------------------------------------------------
 
     max_row = df.loc[
         df["magnitude"].idxmax()
     ]
 
-    # --------------------------------------------------------
-    # Minimum depth
-    # --------------------------------------------------------
+    min_depth = df["depth_km"].min()
+    max_depth = df["depth_km"].max()
 
-    min_depth_row = df.loc[
-        df["depth_km"].idxmin()
-    ]
-
-    # --------------------------------------------------------
-    # Maximum depth
-    # --------------------------------------------------------
-
-    max_depth_row = df.loc[
-        df["depth_km"].idxmax()
-    ]
-
-    # --------------------------------------------------------
-    # Correlation
-    # --------------------------------------------------------
-
-    correlation_columns = [
-        "magnitude",
-        "depth_km",
-        "distance_km",
-        "temperature_2m_mean",
-        "precipitation_sum",
-        "wind_speed_10m_max",
-        "surface_pressure_mean"
-    ]
-
-    correlations = (
-        df[correlation_columns]
-        .corr()["magnitude"]
-        .drop("magnitude")
-        .sort_values(
-            key=lambda x: abs(x),
-            ascending=False
-        )
-    )
-
-    strongest_feature = correlations.index[0]
-
-    strongest_correlation = correlations.iloc[0]
-
-    # --------------------------------------------------------
-    # Insight 1
-    # --------------------------------------------------------
-
-    st.subheader(
-        "1. Magnitudo maksimum"
-    )
-
-    st.write(
-        f"Magnitudo tertinggi pada dataset adalah "
-        f"**{max_row['magnitude']:.2f}**."
-    )
-
-    if pd.notna(max_row["place"]):
-
-        st.write(
-            f"Lokasi kejadian tercatat sebagai "
-            f"**{max_row['place']}**."
-        )
-
-    # --------------------------------------------------------
-    # Insight 2
-    # --------------------------------------------------------
-
-    st.subheader(
-        "2. Kedalaman gempa"
-    )
-
-    st.write(
-        f"Gempa terdangkal memiliki kedalaman sekitar "
-        f"**{min_depth_row['depth_km']:.2f} km**, "
-        f"sedangkan gempa terdalam mencapai sekitar "
-        f"**{max_depth_row['depth_km']:.2f} km**."
-    )
-
-    # --------------------------------------------------------
-    # Insight 3
-    # --------------------------------------------------------
-
-    st.subheader(
-        "3. Variabel yang paling berkorelasi"
-    )
-
-    st.write(
-        f"Variabel dengan hubungan linear paling kuat "
-        f"terhadap magnitudo dalam dataset adalah "
-        f"**{strongest_feature}** dengan koefisien korelasi "
-        f"**{strongest_correlation:.3f}**."
-    )
-
-    # --------------------------------------------------------
-    # Correlation chart
-    # --------------------------------------------------------
-
-    corr_display = correlations.reset_index()
-
-    corr_display.columns = [
-        "Variabel",
-        "Korelasi"
-    ]
-
-    fig = px.bar(
-        corr_display,
-        x="Korelasi",
-        y="Variabel",
-        orientation="h",
-        title="Korelasi Variabel terhadap Magnitudo"
-    )
-
-    fig.update_layout(
-        template="plotly_white",
-        height=450
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True
-    )
-
-    # --------------------------------------------------------
-    # Statistical summary
-    # --------------------------------------------------------
-
-    st.subheader(
-        "4. Ringkasan Statistik"
-    )
-
-    summary = pd.DataFrame({
-        "Indikator": [
-            "Jumlah data",
-            "Rata-rata magnitudo",
-            "Magnitudo maksimum",
-            "Rata-rata kedalaman",
-            "Kedalaman maksimum"
-        ],
-        "Nilai": [
-            f"{len(df):,}",
-            f"{df['magnitude'].mean():.2f}",
-            f"{df['magnitude'].max():.2f}",
-            f"{df['depth_km'].mean():.2f} km",
-            f"{df['depth_km'].max():.2f} km"
-        ]
-    })
-
-    st.dataframe(
-        summary,
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-# ============================================================
-# 14. DATA EXPLORER
-# ============================================================
-
-elif page == "Data Explorer":
-
-    st.header(
-        "🗃️ Data Explorer"
-    )
-
-    st.write(
-        "Gunakan filter berikut untuk mengeksplorasi "
-        "dataset hasil integrasi."
-    )
-
-    # --------------------------------------------------------
-    # Magnitude filter
-    # --------------------------------------------------------
-
-    min_magnitude = float(
-        df["magnitude"].min()
-    )
-
-    max_magnitude = float(
-        df["magnitude"].max()
-    )
-
-    magnitude_filter = st.slider(
-        "Rentang Magnitudo",
-        min_value=min_magnitude,
-        max_value=max_magnitude,
-        value=(
-            min_magnitude,
-            max_magnitude
-        )
-    )
-
-    # --------------------------------------------------------
-    # Depth filter
-    # --------------------------------------------------------
-
-    min_depth = float(
-        df["depth_km"].min()
-    )
-
-    max_depth = float(
-        df["depth_km"].max()
-    )
-
-    depth_filter = st.slider(
-        "Rentang Kedalaman (km)",
-        min_value=min_depth,
-        max_value=max_depth,
-        value=(
-            min_depth,
-            max_depth
-        )
-    )
-
-    # --------------------------------------------------------
-    # Year filter
-    # --------------------------------------------------------
-
-    available_years = sorted(
-        df["year"]
-        .dropna()
-        .astype(int)
-        .unique()
-        .tolist()
-    )
-
-    selected_years = st.multiselect(
-        "Tahun",
-        options=available_years,
-        default=available_years
-    )
-
-    # --------------------------------------------------------
-    # Filtering
-    # --------------------------------------------------------
-
-    filtered_df = df[
-        df["magnitude"].between(
-            magnitude_filter[0],
-            magnitude_filter[1]
-        )
-        &
-        df["depth_km"].between(
-            depth_filter[0],
-            depth_filter[1]
-        )
-        &
-        df["year"].isin(
-            selected_years
-        )
-    ]
-
-    st.divider()
-
-    # --------------------------------------------------------
-    # Filter KPIs
-    # --------------------------------------------------------
+    st.subheader("Temuan Utama")
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
 
         st.metric(
-            "Data Terfilter",
-            f"{len(filtered_df):,}"
+            "Magnitudo Tertinggi",
+            f"{max_row['magnitude']:.2f}",
         )
 
     with col2:
 
-        if len(filtered_df) > 0:
+        st.metric(
+            "Kedalaman Minimum",
+            f"{min_depth:.2f} km",
+        )
 
-            st.metric(
-                "Rata-rata Magnitudo",
-                f"{filtered_df['magnitude'].mean():.2f}"
+    with col3:
+
+        st.metric(
+            "Kedalaman Maksimum",
+            f"{max_depth:.2f} km",
+        )
+
+    st.divider()
+
+    numeric_df = df.select_dtypes(
+        include=np.number
+    )
+
+    correlation = (
+        numeric_df.corr()["magnitude"]
+        .drop("magnitude")
+        .dropna()
+        .sort_values(
+            key=lambda x: x.abs(),
+            ascending=False,
+        )
+    )
+
+    if not correlation.empty:
+
+        strongest_feature = correlation.index[0]
+        strongest_value = correlation.iloc[0]
+
+        st.subheader(
+            "Variabel dengan Korelasi Terkuat"
+        )
+
+        st.write(
+            f"""
+            Variabel **{strongest_feature}** memiliki
+            korelasi paling kuat dengan magnitudo pada
+            dataset ini dengan nilai korelasi
+            **{strongest_value:.3f}**.
+            """
+        )
+
+        corr_plot = (
+            correlation
+            .reset_index()
+        )
+
+        corr_plot.columns = [
+            "variabel",
+            "korelasi",
+        ]
+
+        fig = px.bar(
+            corr_plot,
+            x="variabel",
+            y="korelasi",
+            title="Korelasi Variabel terhadap Magnitudo",
+        )
+
+        fig.update_layout(
+            xaxis_title="Variabel",
+            yaxis_title="Korelasi",
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+        )
+
+    st.subheader("Ringkasan Analisis")
+
+    st.markdown(
+        f"""
+        Berdasarkan **{len(df):,} data kejadian gempa**,
+        analisis menunjukkan bahwa magnitudo memiliki
+        variasi yang berbeda pada setiap kejadian.
+
+        Gempa dengan magnitudo tertinggi pada dataset
+        memiliki nilai **{max_row["magnitude"]:.2f}**,
+        dengan lokasi **{max_row["place"] if pd.notna(max_row["place"]) else "tidak tersedia"}**.
+
+        Data lingkungan dari Open-Meteo digunakan sebagai
+        variabel tambahan untuk melihat hubungan antara
+        kondisi lingkungan dan karakteristik gempa.
+
+        Selain analisis deskriptif, proyek ini menggunakan
+        **Random Forest Regressor** sebagai model machine
+        learning untuk melakukan prediksi magnitudo.
+        """
+    )
+
+
+# ============================================================
+# PAGE 7 — DATA EXPLORER
+# ============================================================
+
+elif page == "Data Explorer":
+
+    st.markdown(
+        '<div class="section-title">Data Explorer</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.subheader("Filter Data")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+
+        min_mag = float(
+            df["magnitude"].min()
+        )
+
+        max_mag = float(
+            df["magnitude"].max()
+        )
+
+        magnitude_range = st.slider(
+            "Rentang Magnitudo",
+            min_value=min_mag,
+            max_value=max_mag,
+            value=(
+                min_mag,
+                max_mag,
+            ),
+        )
+
+    with col2:
+
+        min_depth_value = float(
+            df["depth_km"].min()
+        )
+
+        max_depth_value = float(
+            df["depth_km"].max()
+        )
+
+        depth_range = st.slider(
+            "Rentang Kedalaman (km)",
+            min_value=min_depth_value,
+            max_value=max_depth_value,
+            value=(
+                min_depth_value,
+                max_depth_value,
+            ),
+        )
+
+    with col3:
+
+        year_values = sorted(
+            df["year"]
+            .dropna()
+            .astype(int)
+            .unique()
+            .tolist()
+        )
+
+        if year_values:
+
+            selected_year = st.selectbox(
+                "Tahun",
+                ["Semua"] + year_values,
             )
 
         else:
 
+            selected_year = "Semua"
+
+    filtered_df = df[
+        df["magnitude"].between(
+            magnitude_range[0],
+            magnitude_range[1],
+        )
+        &
+        df["depth_km"].between(
+            depth_range[0],
+            depth_range[1],
+        )
+    ].copy()
+
+    if selected_year != "Semua":
+
+        filtered_df = filtered_df[
+            filtered_df["year"] == selected_year
+        ]
+
+    st.divider()
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric(
+            "Data Terfilter",
+            f"{len(filtered_df):,}",
+        )
+
+    with col2:
+
+        if not filtered_df.empty:
             st.metric(
                 "Rata-rata Magnitudo",
-                "-"
+                f"{filtered_df['magnitude'].mean():.2f}",
+            )
+        else:
+            st.metric(
+                "Rata-rata Magnitudo",
+                "-",
             )
 
     with col3:
 
-        if len(filtered_df) > 0:
-
+        if not filtered_df.empty:
             st.metric(
-                "Rata-rata Kedalaman",
-                f"{filtered_df['depth_km'].mean():.2f} km"
+                "Magnitudo Maksimum",
+                f"{filtered_df['magnitude'].max():.2f}",
             )
-
         else:
-
             st.metric(
-                "Rata-rata Kedalaman",
-                "-"
+                "Magnitudo Maksimum",
+                "-",
             )
 
-    # --------------------------------------------------------
-    # Table
-    # --------------------------------------------------------
+    st.subheader("Data")
 
     display_columns = [
         "usgs_id",
         "event_time",
         "magnitude",
-        "place",
+        "magnitude_category",
         "depth_km",
         "latitude",
         "longitude",
+        "place",
+        "emsc_id",
+        "emsc_magnitude",
         "distance_km",
         "temperature_2m_mean",
         "precipitation_sum",
         "wind_speed_10m_max",
-        "surface_pressure_mean"
+        "surface_pressure_mean",
     ]
 
-    available_columns = [
+    display_columns = [
         column
         for column in display_columns
         if column in filtered_df.columns
     ]
 
-    table = filtered_df[
-        available_columns
-    ].sort_values(
-        "event_time",
-        ascending=False
-    )
-
     st.dataframe(
-        table,
+        filtered_df[
+            display_columns
+        ],
         use_container_width=True,
-        height=600
+        hide_index=True,
     )
 
 
 # ============================================================
-# 15. FOOTER
+# FOOTER
 # ============================================================
 
 st.divider()
