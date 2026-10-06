@@ -39,3 +39,12 @@ Thumbs.db
 *.db
 *.sqlite
 *.sqlite3
+
+# Database backup
+earthquake_db_backup.sql
+# Local database backup
+earthquake_db_backup.sql
+
+# Local database backup
+earthquake_db_backup.sql
+earthquake_db_backup_aiven.sql
