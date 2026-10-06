@@ -6,3 +6,4 @@ sqlalchemy
 pymysql
 joblib
 scikit-learn
+statsmodels
